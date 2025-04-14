@@ -1,0 +1,422 @@
+#!/bin/sh
+
+# IOS - 1. projekt 
+# Autor: Adam Behoun
+# login: xbehoua00
+# fakulta: FIT
+# datum: 10.3.2024
+
+export POSIXLY_CORRECT=yes
+export LC_ALL=C
+
+# ------------------ PROMENNE -------------------- #
+
+# XTF_PROFIT je promenna prostredi, proto kontrolujeme jestli uz je nadefinovana,
+# pokud ne, tak ji nastavime hodnotu 20, jak vyplyva ze specifikace programu
+if [ -z "$XTF_PROFIT" ]; then
+    export XTF_PROFIT=20
+fi
+
+# deklarace promennych, ktere pouzivame 
+DATE_BEFORE=""
+DATE_AFTER=""
+USER_CURRENCY=""
+
+# -------------------- FUNKCE ----------------------- # 
+
+# funkce vytiskne na standardni vystup pomoc k pouzivani programu
+print_help() {
+echo '
+Pouziti skriptu 
+    ./xtf [-h|--help] [FILTR] [PRIKAZ] UZIVATEL LOG [LOG2 [...]]
+
+    [FILTR], [PRIKAZ] a UZIVATEL mohou byt zadany v libovolnem poradi
+    FILTR -c muze byt zadan vicekrat
+
+FILTR - muze byt kombinace nasledujicich:
+    -a "DATETIME" - after - jsou vypisovany pouze zaznamy PO tomto datu a case (mimo nej). DATETIME je ve formatu "YYYY-MM-DD HH:MM:SS".
+    -b "DATETIME" - before - jsou vypisovany pouze zaznamy PRED timto datem a casem (mimo nej). DATETIME je ve formatu "YYYY-MM-DD HH:MM:SS".
+    -c "CURRENCY" - jsou uvazovany pouze zaznamy odpovidajici dane mene. CURRENCY je tripismenny kod (krypto)meny. napr. USD,EUR,CZK,ETH,...
+
+    -h a --help - vypise napovedu s popisem kazdeho prikazu a prepinace .
+
+PRIKAZ - muze byt jeden z:
+    list - vypis zaznamu pro daneho uzivatele. 
+    list-currency - vypis serazeneho seznamu vyskytujicich se men.
+    status - vypis skutecneho stavu uctu seskupeneho a serazeneho dle jednotlivych men.
+    profit - vypis stavu uctu zakaznika se zapocitanym fiktivnim vynosem.
+'
+}
+
+
+# funkce kontroluje format datumu, ktery by mel byt v [YYYY-MM-DD HH:MM:SS]
+# pokud neni, tiskneme na chybovy vystup error
+check_date() {
+    # na porovnani datumu pouzijeme regularni vyraz
+    if ! (echo "$1" | grep -Eq '^([0-9]{4})-([0-9]{2})-([0-9]{2}) ([0-9]{2}):([0-9]{2}):([0-9]{2})$'); then
+        echo "Format datumu neni {YYYY-MM-DD HH:MM:SS}" >&2
+        exit 1;
+    fi
+}
+
+# funkce, ktera vrati prikaz, kterym budeme cist soubory, vzhledem ke komprimaci
+read_command() {
+    # pokud je soubor komprimovany, budeme ho cist pomoci zcat, jinak pomoci cat
+    case $1 in
+        *.gz)
+            echo "zcat";;
+        *)
+            echo "cat";;
+    esac
+}
+
+
+# funkce na zpracovavani filtru, ktere jsou zadavany pri spusteni programu pomoci getopts
+check_filters() {
+    while getopts :a:b:c: o; do
+        case ${o} in 
+            a) 
+                # kontrola, jestli uz nebyl filtr zadan
+                if [ -n "$DATE_AFTER" ]; then
+                    echo "Nespravne spusteny program. \"./xtf -h\" pro napovedu" >&2
+                    exit 1
+                fi
+                # zkontrolujeme spravny format datumu
+                check_date "$OPTARG"
+                DATE_AFTER="$OPTARG"
+                ;;
+            b)
+                # kontrola, jestli uz nebyl filtr zadan
+                if [ -n "$DATE_BEFORE" ]; then
+                    echo "Nespravne spusteny program. \"./xtf -h\" pro napovedu" >&2
+                    exit 1
+                fi
+                check_date "$OPTARG"
+                DATE_BEFORE="$OPTARG"
+                ;;
+            c)
+                # pokud je USER_CURRENCY prazdne, pridame argument
+                if [ -z "$USER_CURRENCY" ]; then
+                    USER_CURRENCY="$OPTARG"
+                # pokud neni, pridame k ostatnim menam aktualni argument s mezerou mezi nimi
+                else
+                    USER_CURRENCY="$USER_CURRENCY $OPTARG"
+                fi
+                ;;
+            :)
+                # pokud neni u nejakeho filtr napsan argument, piseme na chybovy vystup error
+                echo "option -${OPTARG} requires an argument." >&2
+                exit 1;; 
+            *)
+                ;;
+        esac
+    done
+}
+
+# funkce, ktera kontroluje, jestli soubor se jmenem, ktery je parametrem teto funkce, existuje
+# pokud ne, tiskneme na chybovy vystup a ukoncujeme program s chybovou hodnotou 
+check_file () {
+    if [ ! -f "$1" ]; then
+        echo "Soubor se jmenem \"$1\" se nepodarilo otevrit." >&2
+        exit 1;
+    fi
+}
+
+# funkce, ktera vypisuje na standardni vystup zaznamy pro daneho uzivatele ze souboru
+list() {
+    NAME="$1"
+
+    # chceme parametry funkce posunout o 1, aby dalsi parametr byl nazev souboru
+    shift 1
+
+    # pro kazdy soubor ve zbyvajicich argumentech 
+    for file in "$@"
+    do
+
+        check_file "$file"
+        read_cmd=$(read_command "$file")
+
+        $read_cmd "$file"
+
+    # vystup techto souboru presmerujem na vstup awk
+    done | awk -F";" -v name="$NAME" -v date_b="$DATE_BEFORE" \
+    -v date_a="$DATE_AFTER" -v u_curr="$USER_CURRENCY"  '
+    BEGIN{
+        # vytvorime pole currs z men, ktere uzivatel zadal, a ktere jsou oddeleny mezerou 
+        split(u_curr, currs, " ")
+    }
+
+    {
+        # porovnavame, zda se mena v radku, ktery zrovna zpracovavame, rovna nejake z pole currs 
+        # pokud ano, nastavujeme promennou na true, a opoustime cyklus
+        currency_existing=0
+        for(i in currs) {
+            if($3 == currs[i]) {
+                currency_existing=1
+                break
+            }
+        }
+
+        # kontrola:
+        # 1. jestli se rovna jmeno uzivatele s jmenem v souboru
+        # 2. jestli byl vyuzit filtr -b a pokud ano, tak jestli je -b datum vetsi nez ten v souboru
+        # 3. jestli datum v souboru je vetsi nez -a datum, pokud nebyl zadan, tak je tam nejmensi mozny -> vsechny datumy budou vetsi
+        # 4. jestli byl vyuzit filtr -c a pokud ano, tak jestli se mena v souboru vyskytuje v menach specifikovanych filtrem 
+        # pokud tento vyraz vyjde jako true -> vypiseme radek 
+        if ($1 ~ name && (date_b == "" || $2 < date_b) && $2 > date_a && (u_curr == "" || currency_existing)) {print}
+    }'
+}
+
+# funkce, ktera vypise serazeny seznam vyskytujicich se men v souboru/souborech 
+list_currency() {
+    NAME="$1"
+
+    # posouvame argumenty o 1, aby dalsi argument byl (prvni) nazev souboru
+    shift 1
+
+    # pro kazdy soubor ve zbyvajicich parametrech funkce 
+    for file in "$@"
+    do
+        check_file "$file"
+        read_cmd=$(read_command "$file")
+
+        $read_cmd "$file"
+    # obsah souboru dame na vstup awk
+    done | awk -F ";" -v name="$NAME" -v date_b="$DATE_BEFORE" \
+    -v date_a="$DATE_AFTER" -v u_curr="$USER_CURRENCY" '
+    BEGIN{
+         # vytvorime pole currs z men, ktere uzivatel zadal, a ktere jsou oddeleny mezerou 
+        split(u_curr, currs, " ")
+    }
+
+    {
+        # porovnavame, zda se mena v radku, ktery zrovna zpracovavame, rovna nejake z pole currs 
+        # pokud ano, nastavujeme promennou na true, a opoustime cyklus
+        currency_existing=0
+        for(i in currs) {
+            if($3 == currs[i]) {
+                currency_existing=1
+                break
+            }
+        }
+
+        # kontrola:
+        # 1. jestli se rovna jmeno uzivatele s jmenem v souboru
+        # 2. jestli byl vyuzit filtr -b a pokud ano, tak jestli je -b datum vetsi nez ten v souboru
+        # 3. jestli datum v souboru je vetsi nez -a datum, pokud nebyl zadan, tak je tam nejmensi mozny -> vsechny datumy budou vetsi
+        # 4. jestli byl vyuzit filtr -c a pokud ano, tak jestli se mena v souboru vyskytuje v menach specifikovanych filtrem 
+        # pokud se tento vyraz vyhodnoti jako true, tak vypisujeme menu
+        if ($1 ~ name && (date_b == "" || $2 < date_b) && $2 > date_a && (u_curr == "" || currency_existing)) {print $3}
+    }' 
+}
+
+# funkce, ktera bud vypise stav uctu pro daneho uzivatele, nebo vypise stav se zapocitanym fiktivnim vynosem
+status_profit () {
+    NAME="$1"
+    PROFIT="$2"
+
+    # posouvame parametry funkce o 2, abychom se dostali na nazev souboru
+    shift 2
+
+    # pro kazdy soubor ve zbyvajicich parametrech funkce 
+    for file in "$@" 
+    do
+        check_file "$file"
+        read_cmd=$(read_command "$file")
+
+        $read_cmd "$file"
+    # obsah souboru predame na vstup awk
+    done | awk -F ";" -v name="$NAME" -v profit="$PROFIT" \
+    -v date_b="$DATE_BEFORE" -v date_a="$DATE_AFTER" \
+    -v u_curr="$USER_CURRENCY" '
+    BEGIN{
+        # vytvorime pole men, ktere uzivatel zadal, a ktere jsou oddeleny mezerou 
+        split(u_curr, currs, " ")
+    }
+    {
+        # porovnavame, zda se mena v radku, ktery zrovna zpracovavame, rovna nejake z pole currs 
+        # pokud ano, nastavujeme promennou na true, a opoustime cyklus
+        currency_existing=0
+        for(i in currs) {
+            if($3 == currs[i]) {
+                currency_existing=1
+                break
+            }
+        }
+
+        # kontrola:
+        # 1. jestli se rovna jmeno uzivatele s jmenem v souboru
+        # 2. jestli byl vyuzit filtr -b a pokud ano, tak jestli je -b datum vetsi nez ten v souboru
+        # 3. jestli datum v souboru je vetsi nez -a datum, pokud nebyl zadan, tak je tam nejmensi mozny -> vsechny datumy budou vetsi
+        # 4. jestli byl vyuzit filtr -c a pokud ano, tak jestli se mena v souboru vyskytuje v menach specifikovanych filtrem 
+        # pokud se tento vyraz vyhodnoti jako true, pokracujeme
+        if($1 ~ name && (date_b == "" ||$2 < date_b) && $2 > date_a && (u_curr == "" || currency_existing)) {
+            currency = $3
+            value = $4
+
+            # pro kazdou menu, ukladame hodnotu 
+            currency_total[currency] += value
+        }
+    }
+    END {
+        # kazdou menu vypisujeme ve formatu MENA : HODNOTA
+        for (currency in currency_total) {
+            # pokud je hodnota kladna, pripocitame k ni fiktivni zisk, ktery funkce dostala jako parametr
+            if (currency_total[currency] > 0) {
+                printf "%s : %.4f\n", currency, currency_total[currency] * (1 + (profit/100))
+            }
+            # jinak vypisujeme bez zisku
+            else {
+                printf "%s : %.4f\n", currency, currency_total[currency]
+            }
+        }
+    }'
+}
+
+# ---------------------- ZPRACOVANI ARGUMENTU ----------------------#
+
+# pokud je prvni argument programu -h nebo --help tak se vypisuje napoveda, a program konci
+if [ "$1" = "-h" ] || [ "$1" = "--help" ];
+then
+    print_help
+    exit 0;
+fi
+
+
+STATE=0
+# dokud jsou je pocet arugmentu vetsi nez 0
+while [ $# -gt 0 ]; do
+
+    case "$STATE" in
+        0)
+            # 0 - jmeno nezpracovano
+            #   - prikaz nezpracovan
+            case "$1" in
+                -*)
+                    # aktivujeme getopts na argumenty co zpracovavame
+                    check_filters "$@"
+                    shift $((OPTIND-1));;
+                list|list-currency|status|profit)
+                    ORDER=$1
+                    shift
+                    STATE=3;;
+                *)
+                    NAME=$1
+                    shift
+                    STATE=1;;
+            esac;;
+        1)
+            # 1 - jmeno zpracovano
+            #   - prikaz nezpracovan
+            case "$1" in
+                -*)
+                    # aktivujeme getopts na argumenty co zpracovavame
+                    check_filters "$@"
+                    shift $((OPTIND-1));;
+                list|list-currency|status|profit)
+                    ORDER=$1
+                    shift
+                    STATE=2;;
+                *)
+                    STATE=4
+                    break ;;
+            esac;;
+        2)
+            # 2 - jmeno zpracovano
+            #   - prikaz zpracovan
+            case $1 in
+                -*)
+                    # aktivujeme getopts na argumenty co zpracovavame
+                    check_filters "$@"
+                    shift $((OPTIND-1));;
+                *)
+                    STATE=4
+                    break;;
+            esac;;
+        3)
+            # 3 - jmeno nezpracovano
+            #   - prikaz zpracovan
+            case $1 in
+                -*)
+                    # aktivujeme getopts na argumenty co zpracovavame
+                    check_filters "$@"
+                    shift $((OPTIND-1));;
+                list|list-currency|status|profit)
+                    echo "Neni mozne zadat dva prikazy" >&2
+                    exit 1;;
+                *)
+                    NAME=$1
+                    shift
+                    STATE=2;;
+            esac;;
+        esac
+done
+
+# pokud neni STATE nastaven na 4, nebyl program spravne spusten
+if [ "$STATE" != 4 ]; then
+    echo "Nespravne spusteny program. \"./xtf -h\" pro napovedu." >&2
+    exit 1
+fi
+
+#echo "State: $STATE"
+#echo "Jmeno: $NAME"
+#echo "Prikaz: $ORDER"
+#echo "Mena: $USER_CURRENCY"
+#echo "DATE_A: $DATE_AFTER"
+#echo "DATE_B: $DATE_BEFORE"
+#echo "Soubory: $*"
+#exit 2
+
+# kontrola, jestli bylo zadano nejake jmeno
+if [ -z "$NAME" ]; then
+    echo "Nezadano jmeno" >&2
+    exit 1
+fi
+
+# --------- KONTROLA FORMATU SOUBORU ----------- #
+# pro kazdy soubor 
+for file in "$@" 
+do
+    check_file "$file"
+    read_cmd=$(read_command "$file")
+
+    # pouzivame regularni vyrazy pro kazdy sloupec v souboru
+    if ! $read_cmd "$file" | awk -F ";" '{
+            if ($1 != "" && \
+                $2 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}$/ && \
+                $3 ~ /[A-Z]{3}/ && \
+                $4 ~ /^-?[0-9]+(\.[0-9]+)?$/) {
+                next 
+            } else {
+                exit 1;
+            }
+        }'
+    then
+        echo "Soubor $file nesplnuje pozadovany format" >&2
+        exit 1
+    fi
+done 
+
+# podle promenne ORDER spustime prislusnou funkci s parametrama 
+case "$ORDER" in
+    list)
+        # volame funkci, kde prvni argument je NAME a ostatni argumenty 
+        # jsou nazvy souboru 
+        list "$NAME" "$@";;
+    list-currency)
+        # vypiseme meny, abecedne seradime pomoci sort
+        #a zbavime duplikatu pomoci uniq
+        list_currency "$NAME" "$@" | sort | uniq;;
+    status)
+        # volame funkci s NAME a PROFIT = 1, cele to pak seradime pomoci sort
+        status_profit "$NAME" 0 "$@" | sort;;
+    profit)
+        # volame funkci s NAME a PROFIT a ostatni argumenty jsou nazvy souboru
+        # cele to pak seradime pomoci funkce sort
+        status_profit "$NAME" "$XTF_PROFIT" "$@" | sort;;
+    *)
+        # vychozi prikaz je list
+        list "$NAME" "$@"
+esac
+
+exit 0
